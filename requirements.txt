@@ -1,0 +1,2 @@
+pandas>=1.5
+vectorframe @ git+https://github.com/MPoncini96/vectorframe.git
