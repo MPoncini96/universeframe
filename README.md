@@ -29,23 +29,33 @@ scoring plugin are already separate modules.
 ## Fitness scoring (`universeframe.fitness`)
 
 `universeframe.fitness` is a standalone, open-source recreation of the
-walk-forward backtest behind Monstra's `trading.Vector.force_fit_score` and
-`draco_fit_score` columns. For one ticker, it:
+walk-forward fitness scoring behind Monstra's `trading.Vector.force_fit_score`
+and `draco_fit_score` columns — though the two algorithms now ask
+meaningfully different questions:
 
-1. Grid-searches each algorithm's own tunable parameters — Force: lookback
-   days × portfolio size; Draco: minimum entry score × max positions.
-2. Backtests every combo through that algorithm's **real holdings-selection
-   logic** — Force's rank-weighted top-N selection with its incumbency-margin
-   turnover buffer and kill-switch (ported from `bots/alpha1.py`), Draco's
-   multi-timeframe log-linear regression entry/target/exit logic (ported from
-   `draco_math.py` / `bots/draco.py`) — not an approximation of it.
+**Force** (`universeframe/fitness/force.py`):
+
+1. Grid-searches its own tunable parameters — lookback days × portfolio size.
+2. Backtests every combo through its **real holdings-selection logic** —
+   rank-weighted top-N selection with its incumbency-margin turnover buffer
+   and kill-switch (ported from `bots/alpha1.py`) — not an approximation of it.
 3. Walk-forward validates the grid-search winner on data it never saw, so the
    result isn't just "the best of a grid search reporting its own in-sample
    number."
 4. Reduces all of that to a single confidence-penalized fit score in `[0, 1]`,
-   via the same shared `score_combo` / `calculate_algorithm_fit` formulas
-   Monstra's production fitness pipeline uses for every algorithm family
+   via the shared `score_combo` / `calculate_algorithm_fit` formulas
    (`universeframe/fitness/common.py`).
+
+**Draco** (`universeframe/fitness/draco.py`) asks a narrower, ticker-only
+question instead: when this ticker has dipped notably below its own
+regression trend line (the same multi-timeframe log-linear regression the
+live bot trades with — `draco_math.py`), how often and how far does it
+actually come back? For each configured timeframe it measures, out of
+sample, the empirical probability that a dip like today's has historically
+closed within that timeframe's reversion horizon, multiplies by how large
+today's gap actually is, and sums across timeframes using Draco's existing
+per-timeframe weights. No universe or portfolio simulation — one ticker's
+own price history in, one score out.
 
 ```python
 from universeframe.fitness import ForceFitnessRequest, analyze_force_fitness
@@ -56,6 +66,11 @@ result = analyze_force_fitness(ForceFitnessRequest(
     start_date="2025-01-01",
 ))
 print(result["algorithmFit"]["score"], result["algorithmFit"]["label"])
+
+from universeframe.fitness import DracoFitnessRequest, analyze_draco_fitness
+
+draco_result = analyze_draco_fitness(DracoFitnessRequest(ticker="NVDA", start_date="2025-01-01"))
+print(draco_result["algorithmFit"]["score"], draco_result["algorithmFit"]["label"])
 ```
 
 Or from the command line:
@@ -69,10 +84,8 @@ What's substituted, relative to production: the data source (free yfinance
 history here, via `universeframe/fitness/prices.py`, instead of Monstra's
 live Alpaca/Postgres pipeline) and anything that depended on a live
 database — adaptive-universe overrides, persisted bot state
-(`trading.draco_state`), DB-sourced config, Draco's portfolio-level circuit
-breaker (reads live account equity). A standalone run always starts from a
-fixed universe and empty state. See `examples/fitness_quickstart.py` for a
-fuller example.
+(`trading.draco_state`), DB-sourced config. A standalone run always starts
+from empty state. See `examples/fitness_quickstart.py` for a fuller example.
 
 **Not investment advice.** A research/educational tool, not a recommendation
 to buy or sell any security.

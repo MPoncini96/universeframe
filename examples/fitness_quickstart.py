@@ -7,7 +7,6 @@ import json
 import logging
 
 from universeframe.fitness import (
-    DEFAULT_DRACO_UNIVERSE,
     DEFAULT_FORCE_UNIVERSE,
     DracoFitnessRequest,
     ForceFitnessRequest,
@@ -37,12 +36,11 @@ if __name__ == "__main__":
     print(f"\n-- Draco fitness for {TICKER} --")
     draco_request = DracoFitnessRequest(
         ticker=TICKER,
-        universe=[*DEFAULT_DRACO_UNIVERSE, TICKER],
         start_date="2025-01-01",
-        use_market_regime_filter=False,  # faster smoke test; True matches production default
     )
     draco_result = analyze_draco_fitness(draco_request)
     print(f"score={draco_result['algorithmFit']['score']:.3f}  "
           f"label={draco_result['algorithmFit']['label']}  "
-          f"bestMinEntryScore={draco_result['bestCombo']['minimumEntryScore']}  "
-          f"bestMaxPositions={draco_result['bestCombo']['maxPositions']}")
+          f"totalScore={draco_result['algorithmFit']['totalScore']:.4f}")
+    print("per-timeframe breakdown (z-score, distance below trend, reversion probability):")
+    print(json.dumps(draco_result["timeframeBreakdown"], indent=2))

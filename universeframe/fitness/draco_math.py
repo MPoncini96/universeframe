@@ -375,3 +375,369 @@ def project_locked_target(target: LockedTarget, trading_days_held: int) -> float
         EXP_OVERFLOW_GUARD,
     )
     return math.exp(exponent)
+
+
+# ---------------------------------------------------------------------------
+# Mean-reversion fitness scoring
+#
+# Answers a narrower question than the live entry logic above: not "would
+# Draco's full candidate-ranking/entry/exit/circuit-breaker strategy have
+# traded this ticker profitably," but "when this ticker has dipped notably
+# below its own regression trend line, how often and how far does it
+# actually come back?" That's exactly what the per-day (z_score,
+# fitted_price) already computed above measures -- this section scores a
+# ticker's own historical tendency to close that gap, instead of simulating
+# a multi-ticker portfolio trading it. No universe, no portfolio, no
+# stop-loss/circuit-breaker/risk-off simulation: one ticker's own price
+# history in, one score out.
+# ---------------------------------------------------------------------------
+
+# "Meaningfully below trend" -- reuses deviation_points' -1.0 breakpoint (3 of
+# its 6 points) rather than inventing a new threshold.
+DIP_Z_THRESHOLD = -1.0
+
+# How many forward trading days to check whether a dip closed, per timeframe.
+# Shorter timeframes get a shorter recovery window; longer ones get more
+# room, capped at 63 (~1 quarter) so even a 5Y lookback's dip doesn't require
+# waiting years to learn whether it resolved.
+REVERSION_HORIZON_DAYS: dict[str, int] = {
+    "1M": 5,
+    "3M": 10,
+    "6M": 15,
+    "1Y": 21,
+    "2Y": 42,
+    "3Y": 63,
+    "4Y": 63,
+    "5Y": 63,
+}
+
+# Bars between the dip-detection day and the simulated "entry" used to judge
+# the outcome -- the same one-bar fill-lag convention used elsewhere in this
+# codebase's fitness scoring (the decision day's last price point is day
+# D-1's close; the earliest fill that doesn't see the future is day D's
+# close), duplicated locally so this module stays dependency-free.
+REVERSION_FILL_LAG_DAYS = 1
+
+# normalize_reversion_quality()'s sigmoid center/scale. Empirically
+# calibrated (2026-10-26) against an 88-ticker, sector/cap-diverse basket's
+# actual totalScore distribution -- not a guess. The original 0.40/0.35
+# assumed a typical totalScore far higher than what real tickers produce
+# (median was ~0.005, since most tickers aren't currently dipped on any
+# timeframe and so score exactly/near 0 -- correctly, since there's no
+# live opportunity to measure), which clustered ~82% of that basket into
+# "poor" and made the label essentially non-discriminating. 0.19/0.20 keeps
+# every zero-signal ticker in "poor" (no current dip really is "poor" for a
+# dip-timing score) while spreading tickers with a real, currently-active
+# dip across weak/moderate/good/strong based on how large and well-evidenced
+# that dip's reversion history is. Revisit the same way if the real-world
+# totalScore distribution drifts (e.g. after a market regime change, or
+# after further changes to draco_math.py's dip-episode/confidence logic).
+REVERSION_QUALITY_CENTER = 0.19
+REVERSION_QUALITY_SCALE = 0.20
+
+
+def _sigmoid(value: float) -> float:
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+def _walk_forward_split_index(n_rows: int, train_fraction: float) -> int:
+    """Train/test boundary for walk-forward validation: prices[:split] is
+    train, prices[split:] is test. Clamped so both sides are non-empty
+    whenever there are at least 2 rows. Same scheme used elsewhere in this
+    codebase's fitness scoring, duplicated locally so this module stays
+    dependency-free."""
+    if n_rows <= 1:
+        return n_rows
+    split = int(round(n_rows * train_fraction))
+    return min(max(split, 1), n_rows - 1)
+
+
+def fit_label(score: float) -> str:
+    if score >= 0.80:
+        return "strong"
+    if score >= 0.65:
+        return "good"
+    if score >= 0.50:
+        return "moderate"
+    if score >= 0.35:
+        return "weak"
+    return "poor"
+
+
+def normalize_reversion_quality(total_score: float) -> float:
+    return _clamp(_sigmoid((total_score - REVERSION_QUALITY_CENTER) / REVERSION_QUALITY_SCALE), 0.0, 1.0)
+
+
+@dataclass(frozen=True)
+class DipEpisode:
+    """One maximal run of consecutive below-threshold days, judged only at
+    its first ("anchor") day -- the days after that overlap the same
+    recovery window and aren't independent evidence."""
+    anchor_index: int
+    z_score: float
+    fitted_price_at_anchor: float
+    reverted: bool | None  # None when there isn't enough forward data yet to judge
+
+
+@dataclass(frozen=True)
+class ReversionStats:
+    label: str
+    episode_count: int  # episodes with a judged (non-None) outcome
+    reverted_count: int
+    reversion_probability: float
+
+
+def find_dip_episodes(
+    z_scores: Sequence[float],
+    fitted_prices: Sequence[float],
+    full_prices: Sequence[float],
+    *,
+    anchor_offset: int,
+    horizon_days: int,
+    fill_lag_days: int = REVERSION_FILL_LAG_DAYS,
+    dip_threshold: float = DIP_Z_THRESHOLD,
+    slopes: Sequence[float] | None = None,
+) -> list[DipEpisode]:
+    """Scan `z_scores`/`fitted_prices` (positionally aligned, starting at
+    absolute day `anchor_offset` within `full_prices`) for dip episodes and
+    judge each one: did price close at or above that day's fitted trend line
+    within `horizon_days` trading days, starting `fill_lag_days` days after
+    the dip was detected?
+
+    When `slopes` is given (one value per z-score), a day only counts as a
+    dip if this timeframe's own trend line is upward-sloping there too --
+    mirroring the live strategy's own positive-slope requirement (see
+    EntryRequirements.minimum_positive_slope_timeframes). A decline against a
+    *downward*-sloping line isn't a setup Draco would ever trade, so it
+    shouldn't count as reversion evidence either."""
+    episodes: list[DipEpisode] = []
+    in_dip = False
+    for i, z in enumerate(z_scores):
+        is_uptrend = slopes is None or slopes[i] > 0.0
+        is_dip_day = (z <= dip_threshold) and is_uptrend
+        if is_dip_day and not in_dip:
+            exit_idx = anchor_offset + i + fill_lag_days + horizon_days
+            reverted: bool | None = None
+            if 0 <= exit_idx < len(full_prices):
+                reverted = float(full_prices[exit_idx]) >= float(fitted_prices[i])
+            episodes.append(DipEpisode(
+                anchor_index=anchor_offset + i,
+                z_score=float(z),
+                fitted_price_at_anchor=float(fitted_prices[i]),
+                reverted=reverted,
+            ))
+        in_dip = is_dip_day
+    return episodes
+
+
+def summarize_reversion(label: str, episodes: Sequence[DipEpisode]) -> ReversionStats:
+    judged = [e for e in episodes if e.reverted is not None]
+    reverted_count = sum(1 for e in judged if e.reverted)
+    probability = (reverted_count / len(judged)) if judged else 0.0
+    return ReversionStats(
+        label=label,
+        episode_count=len(judged),
+        reverted_count=reverted_count,
+        reversion_probability=probability,
+    )
+
+
+def rolling_timeframe_series(
+    prices: np.ndarray,
+    label: str,
+    lookback: int,
+    *,
+    start_index: int,
+) -> tuple[list[float], list[float], list[float]]:
+    """z_score, fitted_price, and annualized_slope for every day from
+    `start_index` through the end of `prices`, recomputing the trailing
+    `lookback`-bar regression fresh each day (no state carried across days,
+    matching the live scan's own per-day recompute)."""
+    z_scores: list[float] = []
+    fitted_prices: list[float] = []
+    slopes: list[float] = []
+    for i in range(start_index, len(prices)):
+        metrics = compute_timeframe_metrics(label, lookback, prices[: i + 1])
+        if metrics is None:
+            z_scores.append(0.0)
+            fitted_prices.append(float(prices[i]))
+            slopes.append(0.0)
+        else:
+            z_scores.append(metrics.z_score)
+            fitted_prices.append(metrics.fitted_price)
+            slopes.append(metrics.annualized_slope)
+    return z_scores, fitted_prices, slopes
+
+
+@dataclass(frozen=True)
+class TimeframeReversionProfile:
+    label: str
+    lookback: int
+    weight: float
+    z_score_now: float
+    distance_to_mean_now: float  # max(fitted/current - 1, 0.0)
+    reversion_probability_train: float
+    reversion_probability_test: float | None
+    episode_count_train: int
+    episode_count_test: int
+    expected_value: float  # scoring probability * distance_to_mean_now, 0 unless currently dipped
+
+
+def compute_timeframe_reversion_profile(
+    prices: np.ndarray,
+    label: str,
+    lookback: int,
+    weight: float,
+    *,
+    start_index: int,
+    split_index: int,
+    horizon_days: int,
+) -> TimeframeReversionProfile | None:
+    """One timeframe's full mean-reversion profile for a single ticker:
+    train-period reversion probability, an out-of-sample re-check on the
+    test period (mirroring this codebase's other walk-forward validations),
+    and today's live dip distance. Returns None when there isn't enough
+    history to warm up this lookback."""
+    if len(prices) <= lookback:
+        return None
+    scan_start = max(lookback, start_index)
+    if scan_start >= len(prices):
+        return None
+
+    full_z, full_fitted, full_slopes = rolling_timeframe_series(prices, label, lookback, start_index=scan_start)
+    # full_z[i] / full_fitted[i] / full_slopes[i] correspond to absolute day `scan_start + i`.
+
+    train_end = max(0, min(len(full_z), split_index - scan_start))
+    train_episodes = find_dip_episodes(
+        full_z[:train_end], full_fitted[:train_end], prices,
+        anchor_offset=scan_start, horizon_days=horizon_days,
+        slopes=full_slopes[:train_end],
+    )
+    train_stats = summarize_reversion(label, train_episodes)
+
+    test_stats: ReversionStats | None = None
+    if train_end < len(full_z):
+        test_episodes = find_dip_episodes(
+            full_z[train_end:], full_fitted[train_end:], prices,
+            anchor_offset=scan_start + train_end, horizon_days=horizon_days,
+            slopes=full_slopes[train_end:],
+        )
+        test_stats = summarize_reversion(label, test_episodes)
+
+    # Prefer the out-of-sample (test-period) reversion rate when there's any
+    # test-period evidence to measure it from -- same "trust the held-out
+    # result, not the in-sample one" principle this codebase already applies
+    # to Force/Aptet/Draco's grid-search walk-forward validation.
+    scoring_probability = (
+        test_stats.reversion_probability
+        if test_stats is not None and test_stats.episode_count > 0
+        else train_stats.reversion_probability
+    )
+
+    now_z = full_z[-1]
+    now_fitted = full_fitted[-1]
+    now_current = float(prices[-1])
+    distance_to_mean_now = max(0.0, now_fitted / now_current - 1.0) if now_current > 0 else 0.0
+    is_dipped_now = now_z < 0.0
+    expected_value = (scoring_probability * distance_to_mean_now) if is_dipped_now else 0.0
+
+    return TimeframeReversionProfile(
+        label=label,
+        lookback=lookback,
+        weight=weight,
+        z_score_now=now_z,
+        distance_to_mean_now=distance_to_mean_now,
+        reversion_probability_train=train_stats.reversion_probability,
+        reversion_probability_test=(test_stats.reversion_probability if test_stats is not None else None),
+        episode_count_train=train_stats.episode_count,
+        episode_count_test=(test_stats.episode_count if test_stats is not None else 0),
+        expected_value=expected_value,
+    )
+
+
+def _reversion_confidence(profiles: Sequence[TimeframeReversionProfile], *, timeframe_count: int) -> float:
+    total_test_episodes = sum(p.episode_count_test for p in profiles)
+    sample_component = _clamp(math.sqrt(total_test_episodes / 20.0), 0.0, 1.0)
+
+    stability_terms = [
+        1.0 - min(1.0, abs(p.reversion_probability_train - p.reversion_probability_test))
+        for p in profiles
+        if p.episode_count_train > 0 and p.episode_count_test > 0 and p.reversion_probability_test is not None
+    ]
+    stability_component = (sum(stability_terms) / len(stability_terms)) if stability_terms else 0.4
+
+    coverage_component = _clamp(len(profiles) / float(max(1, timeframe_count)), 0.0, 1.0)
+
+    return _clamp(
+        (sample_component * 0.45) + (stability_component * 0.35) + (coverage_component * 0.20),
+        0.0,
+        1.0,
+    )
+
+
+@dataclass(frozen=True)
+class MeanReversionFitness:
+    ticker: str
+    total_score: float
+    raw_score: float  # sigmoid-normalized quality in [0, 1], before the confidence penalty
+    confidence: float
+    score: float  # confidence-penalized final score in [0, 1]
+    label: str
+    profiles: list[TimeframeReversionProfile]
+    start_index: int  # absolute position in `prices` where the scored window begins
+    split_index: int  # absolute position where the train/test walk-forward split falls
+
+
+def compute_mean_reversion_fitness(
+    prices: np.ndarray,
+    ticker: str,
+    *,
+    start_index: int = 0,
+    lookbacks: dict[str, int] = LOOKBACKS,
+    weights: dict[str, float] = TIMEFRAME_WEIGHTS,
+    horizons: dict[str, int] = REVERSION_HORIZON_DAYS,
+    train_fraction: float = 0.70,
+) -> MeanReversionFitness | None:
+    """Score how good a Draco mean-reversion candidate `ticker` is *right
+    now*: for each configured timeframe, how reliably (out of sample) this
+    ticker has historically closed a meaningful gap below its own trend
+    line, multiplied by how large that gap is today -- summed across
+    timeframes using Draco's existing longer-is-weighted-more scheme.
+    Returns None when there isn't enough history for even the shortest
+    configured timeframe."""
+    longest_lookback = max(lookbacks.values())
+    effective_start = max(longest_lookback, start_index)
+    if effective_start >= len(prices):
+        return None
+
+    scoring_length = len(prices) - effective_start
+    split_index = effective_start + _walk_forward_split_index(scoring_length, train_fraction)
+
+    profiles: list[TimeframeReversionProfile] = []
+    for label, lookback in lookbacks.items():
+        profile = compute_timeframe_reversion_profile(
+            prices, label, lookback, weights.get(label, 1.0),
+            start_index=effective_start, split_index=split_index,
+            horizon_days=horizons.get(label, 21),
+        )
+        if profile is not None:
+            profiles.append(profile)
+    if not profiles:
+        return None
+
+    total_score = sum(p.expected_value * p.weight for p in profiles)
+    raw_score = normalize_reversion_quality(total_score)
+    confidence = _reversion_confidence(profiles, timeframe_count=len(lookbacks))
+    score = _clamp(raw_score * confidence + raw_score * (1.0 - confidence) * 0.5, 0.0, 1.0)
+
+    return MeanReversionFitness(
+        ticker=ticker,
+        total_score=total_score,
+        raw_score=raw_score,
+        confidence=confidence,
+        score=score,
+        label=fit_label(score),
+        profiles=profiles,
+        start_index=effective_start,
+        split_index=split_index,
+    )
